@@ -1,44 +1,45 @@
+### Imports ###
+
+# Standard Python libraries
 import datetime
 import inspect
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-import tiktoken
+from typing import Dict, List, Optional
 
-import ephemerear.functions
+# Third party libraries
 import openai
 import requests
-import yaml
 from requests.exceptions import RequestException
 
-def count_tokens(text, encoding_name = 'p50k_base'):
-    encoding = tiktoken.get_encoding(encoding_name)
-    num_tokens = len(encoding.encode(text))
-    return num_tokens
+# Within module imports
+import EphemeralBablefish.ephemerear.functions as eefunctions
+from .documentModification import count_tokens
+from .earIO import load_yaml_to_dict
 
-def testforword(text, word, splitrange=15):
-    import re
-    if text is None:
-        return False
-    splitrange = min(splitrange, len(text.split()))
-    wordmatched = False
-    text_split = text.lower().split()[0:splitrange]
-    for split_word in text_split:
-        if re.match(word + ".*", split_word):
-            wordmatched = True
-    return wordmatched
+### End of Imports ###
 
+
+### Function Definition ###
+
+# LLM agent using predefined config and sys prompts.
+# Manages message history, sends Pushover notifications, and stores responses in Markdown format.
 class EphemerEar:
+
+    # Instantiate the class utilising the details in the config.yaml
     def __init__(self, config_path: str = 'config.yaml') -> None:
-        self.config_path = Path(config_path).resolve()
-        self.config = self.load_yaml_to_dict(config_path)
+
+        # Load the project-level settings in the config.yaml into an in-memory Python dictionary for operations.
+        self.config = load_yaml_to_dict(config_path)
         verify_and_create_paths(self.config)
 
+        # Get the history file path from the location of the history file.
         history_file_path_str = self.config['bot']['history_file']
         self.history_file_path = Path(history_file_path_str)
         # Instead, set history_file_path to us config['bot']['root_dir'] plus the history_file path
-        
+
+        # Set the system prompt, api_key, model to use, key for pushover, pushover use, notify setting, user history.
         self.system_prompt = self.make_system_prompt()
         self.api_key = self.config['auth_tokens']['openai']
         self.model = self.config['bot']['model']
@@ -46,11 +47,16 @@ class EphemerEar:
         self.pushover_user = self.config['auth_tokens'].get('pushover_user', '')
         self.notify = bool(self.pushover_key and self.pushover_user and self.config['bot']['use_pushover'])
         self.initialize_history_file()
-        # Derive available functions from functions file
-        self.functions_module = ephemerear.functions
+
+        # Derive available functions from the functions file.
+        self.functions_module = eefunctions
         self.available_functions, self.functions_definitions = self._load_functions_from_module(self.functions_module)
 
+
+    #
     def _load_functions_from_module(self, module):
+
+            # Define placeholder structures to update, used in creating functions_definitions in format OpenAI expects
             functions_dict = {}
             function_definitions_list = []
             
@@ -71,31 +77,27 @@ class EphemerEar:
 
             return functions_dict, functions_definitions
 
-    def load_yaml_to_dict(self, filepath: str) -> Dict[str, Any]:
-        yaml_file_path = Path(filepath).resolve()
-        if not yaml_file_path.is_file():
-            raise FileNotFoundError(f"The file {filepath} does not exist.")
-        
-        with yaml_file_path.open('r') as file:
-            try:
-                config = yaml.safe_load(file)
-                return config
-            except yaml.YAMLError as exc:
-                raise ValueError(f"Error parsing YAML file: {exc}")
 
+    # Returns the system_prompt formatted with the user name, user_details, and bot name.
     def make_system_prompt(self) -> str:
+        # Retrieve paths for the user details and the system prompt.
         system_prompt_path = Path(self.config['bot']['system_prompt'])
         user_details_path = Path(self.config['user']['user_details'])
 
+        # Check whether the user details and system prompt data exists in defined files
         if not system_prompt_path.is_file() or not user_details_path.is_file():
             raise FileNotFoundError("Required file for system prompt or user details is missing.")
 
+        # Get user details and system prompt from saved files. Update to use SQLite.
         with system_prompt_path.open('r') as file:
             system_prompt = file.read()
         with user_details_path.open('r') as file:
             user_details = file.read()
 
-        return system_prompt.format(user_name=self.config['user']['name'], user_details=user_details, bot_name=self.config['bot']['name'])
+        # Return username, the bot name, and the details for the user.
+        return system_prompt.format(user_name=self.config['user']['name'],
+                                    user_details=user_details,
+                                    bot_name=self.config['bot']['name'])
 
     def initialize_history_file(self) -> None:
         if not self.history_file_path.is_file():
@@ -142,22 +144,30 @@ class EphemerEar:
                 return response
             except RequestException as e:
                 raise RequestException(f"Failed to send the message: {e}")
-            
-    def gpt_chat(self, message: str, model: str = "gpt-3.5-turbo-16k", max_tokens: int = 800, notify: bool = True, available_functions: dict = None) -> str:
+
+    #
+    def gpt_chat(self,
+                 message: str,
+                 model: str = "gpt-3.5-turbo-16k",
+                 max_tokens: int = 800,
+                 notify: bool = True,
+                 available_functions: dict = None) -> str:
+
+        # Establish a model and message history.
         history = self.get_history()
         model = self.model
         notify = self.notify
         messages = history.copy()
         messages.append({"role": "user", "content": message})
+
+        # If available_functions is not set, inherit from class
         if available_functions is None:
             available_functions = self.functions_definitions["functions"]
-
 
         max_message_window = self.config['bot']['max_message_window']
 
         # Filter to exclude system messages and reverse the list to start from the oldest
         non_system_messages = list(filter(lambda m: m['role'] != 'system', messages))
-        non_system_messages.reverse()
 
         # Compute the token count and remove messages if necessary
         running_token_count = 0
@@ -165,14 +175,14 @@ class EphemerEar:
             token_count = count_tokens(m['content'])
             if running_token_count + token_count > max_message_window:
                 # When limit is exceeded, continue removing from the oldest
-                non_system_messages.remove(m)
+                non_system_messages.pop()
             else:
                 running_token_count += token_count
 
-        # Reverse back and add system message to the beginning
-        non_system_messages.reverse()
+        # Recombine non system messages with a dictionary that contains the system prompt.
         all_messages = [{"role": "system", "content": self.system_prompt}] + non_system_messages
 
+        # Make a call to the OpenAI APIs and get the bot response.
         completion = openai.ChatCompletion.create(
             model=model,
             messages=all_messages,
@@ -214,7 +224,10 @@ class EphemerEar:
         self.save_history(history)
         self.write_response_to_markdown(message, confirmation_message)
         if notify:
-            self.send_pushover(title="ephemerear", message=f"Response: {confirmation_message}", user_key=self.pushover_user, api_key=self.pushover_key)
+            self.send_pushover(title="ephemerear",
+                               message=f"Response: {confirmation_message}",
+                               user_key=self.pushover_user,
+                               api_key=self.pushover_key)
 
         if notify:
             self.send_pushover(
@@ -284,7 +297,9 @@ def verify_and_create_paths(config: dict) -> None:
 
 {{user_details}}
 
-{{user_name}}'s 'user' messages will be sent to you via transcription. Be sensitive to the fact that some user messages may contain misspellings or 'similar' phonetic spellings due to limitations in the transcription engine.
+{{user_name}}'s 'user' messages will be sent to you via transcription. 
+
+Be sensitive to the fact that some user messages may contain misspellings or 'similar' phonetic spellings due to limitations in the transcription engine.
 
 Your name is {{bot_name}}.
 
